@@ -47,7 +47,9 @@ if os.name == "nt":
             setattr(C, a, "")
 
 def log(m): print(m)
-UA = "Mozilla/5.0 (X11; Linux x86_64) apifinder/1.0"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+EXTRA_HEADERS = {}   # rempli par -H/--header (ex: X-HackerOne-Research)
 
 # ----------------------------------------------------------------------
 # HTTP (GET + POST, sans suivre les redirections)
@@ -68,6 +70,7 @@ def http_req(url, method="GET", body=None, headers=None, timeout=10, max_body=30
         h = {"User-Agent": UA, "Accept": "application/json, */*"}
         if body is not None:
             h["Content-Type"] = "application/json"
+        h.update(EXTRA_HEADERS)
         if headers:
             h.update(headers)
         conn.request(method, path, body=body, headers=h)
@@ -275,6 +278,168 @@ def check_juicy(base, args):
     return hits
 
 # ----------------------------------------------------------------------
+# F. Fuite de schema DTO via erreurs de validation
+# ----------------------------------------------------------------------
+# Les frameworks modernes REVELENT les champs requis (et parfois le classpath)
+# dans leurs erreurs de validation. En envoyant un corps vide puis en ajoutant
+# les champs un a un, on reconstruit le DTO SANS documentation ni auth.
+FRAMEWORK_SIGNS = [
+    ("Micronaut",  lambda b, h: '"_embedded"' in b and '"_links"' in b),
+    ("Spring Boot", lambda b, h: '"timestamp"' in b and '"path"' in b) ,
+    ("Spring (valid)", lambda b, h: '"defaultMessage"' in b or '"bindingResult"' in b),
+    ("FastAPI/Pydantic", lambda b, h: '"loc"' in b and '"msg"' in b),
+    ("Laravel", lambda b, h: 'The given data was invalid' in b or '"errors"' in b and 'laravel' in h.get("set-cookie","").lower()),
+    ("ASP.NET Core", lambda b, h: 'One or more validation errors' in b or "kestrel" in h.get("server","").lower()),
+    ("Django REST", lambda b, h: 'wsgiserver' in h.get("server","").lower() or '"detail"' in b and 'method' in b.lower()),
+    ("Rails", lambda b, h: 'param is missing' in b),
+    ("Express/Node", lambda b, h: 'Cannot POST' in b or 'Unexpected token' in b or 'express' in h.get("x-powered-by","").lower()),
+]
+# regex qui extraient un/des nom(s) de champ requis selon le framework
+FIELD_RX = [
+    re.compile(r"parameter\s+([A-Za-z_]\w+)"),                         # Micronaut/Jackson
+    re.compile(r"Required\s+(?:Body|argument|Parameter)\s+\[?([A-Za-z_]\w+)"),
+    re.compile(r'"loc"\s*:\s*\[\s*"[^"]*"\s*,\s*"([A-Za-z_]\w+)"'),    # FastAPI
+    re.compile(r'"field"\s*:\s*"([A-Za-z_]\w+)"'),                     # Spring valid
+    re.compile(r"param is missing[^:]*:\s*([A-Za-z_]\w+)"),           # Rails
+    re.compile(r'"([A-Za-z_]\w+)"\s*:\s*\[\s*"[^"]*(?:required|obligatoire|manquant)'),  # DRF/.NET/Laravel
+    re.compile(r"([A-Za-z_]\w+)\s+(?:is required|must not be null|cannot be null)", re.I),
+    re.compile(r"Missing\s+(?:required\s+)?(?:field|parameter)\s+['\"]?([A-Za-z_]\w+)"),
+]
+CLASSPATH_RX = re.compile(r"(?:instance of|construct)\s+[`'\"]?([a-zA-Z_][\w.$]+\.[A-Z]\w+)")
+CTYPE_RX = re.compile(r"[Aa]llowed(?:\s+types)?\s*:?\s*\[?\s*([a-z]+/[a-z0-9.+-]+)")
+
+def _fingerprint(body_text, hdrs):
+    for name, fn in FRAMEWORK_SIGNS:
+        try:
+            if fn(body_text, hdrs):
+                return name
+        except Exception:
+            pass
+    return "?"
+
+def _extract_fields(body_text):
+    fields = []
+    for rx in FIELD_RX:
+        for m in rx.finditer(body_text):
+            f = m.group(1)
+            if f and f.lower() not in ("form", "request", "body", "null", "dto") and f not in fields:
+                fields.append(f)
+    return fields
+
+# valeurs heuristiques par nom de champ : evite de caler sur enums/URI/types
+# (sinon la valeur "1" fait echouer la conversion et masque le champ suivant)
+FILLERS = [
+    (("response_type", "responsetype"), "code"),
+    (("grant_type", "granttype"), "authorization_code"),
+    (("scope",), "openid"),
+    (("code_challenge_method", "challengemethod"), "S256"),
+    (("code_challenge", "challenge"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"),
+    (("redirect_uri", "redirecturi", "redirect_url", "redirecturl", "url", "uri", "callback"), "https://example.com/"),
+    (("email", "mail"), "test@example.com"),
+    (("phone", "msisdn", "telephone"), "+15555550100"),
+    (("nonce", "state"), "abc123xyz"),
+    (("client_id", "clientid"), "test"),
+    (("password", "passwd", "pwd"), "Password123!"),
+    (("bool", "enabled", "active", "require"), "true"),
+]
+def _filler(field):
+    fl = field.lower()
+    for keys, val in FILLERS:
+        if any(k in fl for k in keys):
+            return val
+    return "1"
+
+def _variants(field):
+    """camelCase <-> snake_case : on envoie les deux, le binder honore la bonne
+    (Jackson SNAKE_CASE attend response_type, l'API peut vouloir responseType)."""
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", field).lower()
+    parts = field.split("_")
+    camel = parts[0] + "".join(w.capitalize() for w in parts[1:])
+    return {field, snake, camel}
+
+def _encode(fields, ctype):
+    """Construit un corps avec les champs connus (valeur heuristique) selon le content-type.
+    Si aucun champ connu, on met un champ-sonde pour que le binder tente de construire
+    le DTO (sinon certains frameworks repondent juste 'body manquant')."""
+    payload = {}
+    for f in fields:
+        val = _filler(f)
+        for name in _variants(f):
+            payload[name] = val
+    if not payload:
+        payload = {"_probe": "1"}
+    if "form-urlencoded" in ctype:
+        from urllib.parse import urlencode
+        return urlencode(payload), {"Content-Type": "application/x-www-form-urlencoded"}
+    return json.dumps(payload), {"Content-Type": "application/json"}
+
+def probe_dto(url, args, method="POST"):
+    """Reconstruit le DTO d'un endpoint par fuite d'erreurs de validation."""
+    ctype = "application/json"
+    known, classpath, framework = [], None, "?"
+    rounds, samples = 0, []
+    body_str, hdr = _encode(known, ctype)
+    while rounds < 15:
+        rounds += 1
+        r = http_req(url, method=method, body=body_str, headers=hdr, timeout=args.timeout)
+        if not r:
+            return None
+        bt = r["body"].decode("utf-8", "ignore")
+        samples.append({"round": rounds, "status": r["status"], "snippet": bt[:200]})
+        # content-type impose ? (415)
+        mc = CTYPE_RX.search(bt)
+        if r["status"] == 415 and mc:
+            ctype = mc.group(1)
+            body_str, hdr = _encode(known, ctype)
+            continue
+        if framework == "?":
+            framework = _fingerprint(bt, r["headers"])
+        cp = CLASSPATH_RX.search(bt)
+        if cp and not classpath:
+            classpath = cp.group(1)
+        new = [f for f in _extract_fields(bt) if f not in known]
+        if not new:
+            # plus de champ requis manquant -> on s'arrete (on a atteint la validation metier)
+            return {"url": url, "method": method, "framework": framework,
+                    "content_type": ctype, "fields": known, "classpath": classpath,
+                    "final_status": r["status"], "final_body": bt[:300], "rounds": rounds}
+        known += new
+        body_str, hdr = _encode(known, ctype)
+    return {"url": url, "method": method, "framework": framework, "content_type": ctype,
+            "fields": known, "classpath": classpath, "final_status": None,
+            "final_body": "(15 tours atteints)", "rounds": rounds}
+
+def run_dto(base, endpoints, args):
+    log(f"\n{C.B}{C.BD}[F] Fuite de schema DTO (erreurs de validation)...{C.X}")
+    results = []
+    targets = []
+    for ep in endpoints:
+        ep = ep.strip()
+        if not ep:
+            continue
+        url = ep if re.match(r"^https?://", ep) else f"{base}/{ep.lstrip('/')}"
+        targets.append(url)
+    if not targets:
+        log(f"  {C.GR}(aucun endpoint a sonder — passe -e /chemin ou active un schema){C.X}")
+        return results
+    for url in targets:
+        res = probe_dto(url, args)
+        if not res:
+            log(f"  {C.GR}injoignable : {url}{C.X}")
+            continue
+        results.append(res)
+        fw = f"{C.CY}{res['framework']}{C.X}"
+        log(f"  {C.G}{C.BD}{url}{C.X}  [{fw}, {res['content_type']}]")
+        if res["classpath"]:
+            log(f"    {C.R}classpath fuite : {res['classpath']}{C.X}")
+        if res["fields"]:
+            log(f"    {C.Y}champs requis ({len(res['fields'])}) : {C.X}"
+                + ", ".join(res["fields"]))
+        log(f"    {C.GR}validation atteinte (status {res['final_status']}): "
+            f"{res['final_body'][:120]}{C.X}")
+    return results
+
+# ----------------------------------------------------------------------
 # E. Fuzzing des routes API
 # ----------------------------------------------------------------------
 def calibrate(base, timeout):
@@ -361,6 +526,14 @@ def save_report(base, data, out):
         f.write("\n[Endpoints juteux]\n")
         for h in data["juicy"]:
             f.write(f"  {h['status']}  /{h['path']}  [{h['length']} o]\n")
+        if data.get("dto"):
+            f.write("\n[DTO reconstruits (fuite via erreurs de validation)]\n")
+            for d in data["dto"]:
+                f.write(f"  {d['method']} {d['url']}  [{d['framework']}, {d['content_type']}]\n")
+                if d["classpath"]:
+                    f.write(f"    classpath: {d['classpath']}\n")
+                f.write(f"    champs requis: {', '.join(d['fields']) or '(aucun)'}\n")
+                f.write(f"    validation (status {d['final_status']}): {d['final_body'][:160]}\n")
         f.write("\n[Routes fuzz]\n")
         for h in data["fuzz"]:
             f.write(f"  {h['status']}  /{h['path']}\n")
@@ -404,6 +577,12 @@ def main():
 ------------------------------------------------------------------------
 """)
     p.add_argument("url", nargs="?", help="URL de l'API (http://api.example.com)")
+    p.add_argument("--dto", action="store_true",
+                   help="Fuite de schema DTO : reconstruit les champs requis via les erreurs de validation")
+    p.add_argument("-e", "--endpoint", action="append", default=[],
+                   help="Endpoint(s) a sonder pour le DTO (repetable, ex: -e /auth/api/v1/auth-flow/par)")
+    p.add_argument("-H", "--header", action="append", default=[],
+                   help="Header custom 'Nom: valeur' (repetable, ex: X-HackerOne-Research)")
     p.add_argument("--fuzz", action="store_true", help="Activer le fuzzing des routes (SecLists)")
     p.add_argument("--seclists", help="Chemin de SecLists si non trouve")
     p.add_argument("-t", "--threads", type=int, default=40, help="Threads (defaut 40)")
@@ -416,6 +595,11 @@ def main():
     if not args.url:
         p.print_help(); sys.exit(0)
 
+    for hv in args.header:
+        if ":" in hv:
+            k, v = hv.split(":", 1)
+            EXTRA_HEADERS[k.strip()] = v.strip()
+
     base = normalize(args.url)
     root = http_req(base + "/", timeout=args.timeout)
     if root is None:
@@ -425,7 +609,7 @@ def main():
     start = time.time()
 
     data = {"target": base, "schemas": [], "endpoints": [], "versions": [],
-            "graphql": [], "juicy": [], "fuzz": []}
+            "graphql": [], "juicy": [], "fuzz": [], "dto": []}
 
     # A. schemas + parse
     schemas = find_schemas(base, args)
@@ -448,6 +632,14 @@ def main():
     data["graphql"] = check_graphql(base, args)
     data["juicy"] = check_juicy(base, args)
 
+    # F. DTO leak (endpoints explicites + endpoints POST/PUT du schema)
+    if args.dto or args.endpoint:
+        eps = list(args.endpoint)
+        for m, path in data["endpoints"]:
+            if m in ("POST", "PUT", "PATCH") and path not in eps:
+                eps.append(path)
+        data["dto"] = run_dto(base, eps, args)
+
     # E. fuzz
     if args.fuzz:
         data["fuzz"] = fuzz_routes(base, args)
@@ -462,6 +654,10 @@ def main():
     gql = sum(1 for g in data['graphql'] if g['introspection'])
     log(f"  GraphQL introspection : {(C.R+'OUI'+C.X) if gql else 'non'}")
     log(f"  Endpoints juteux      : {C.Y}{len(data['juicy'])}{C.X}")
+    if data.get("dto"):
+        tot_fields = sum(len(d["fields"]) for d in data["dto"])
+        log(f"  DTO reconstruits      : {C.G}{len(data['dto'])}{C.X} "
+            f"({tot_fields} champ(s) fuite(s))")
     log(f"  Routes fuzz           : {len(data['fuzz'])}")
     log(f"\n{C.GR}Termine en {time.time()-start:.1f}s{C.X}")
 

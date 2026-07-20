@@ -284,6 +284,42 @@ def stage_nuclei(live_file, outdir, args):
     return nuclei_file
 
 # ----------------------------------------------------------------------
+# 6. Analyse JS (jsleaks : chunks lazy-load + config + secrets + sinks)
+# ----------------------------------------------------------------------
+def stage_jsleaks(live_file, urls_file, outdir, args):
+    stage("6. ANALYSE JS (jsleaks)")
+    js_here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jsleaks.py")
+    if not os.path.isfile(js_here):
+        log(f"{C.Y}[i] jsleaks.py introuvable -> etape sautee.{C.X}")
+        return
+    # 1) URLs .js depuis les URLs collectees
+    js_urls = sorted({u for u in read_lines(urls_file) if ".js" in u.lower()})
+    # 2) + les pages live (jsleaks suit leurs chunks + recupere la config runtime)
+    pages = read_lines(live_file)[:args.js_pages]
+    seeds = js_urls + pages
+    if not seeds:
+        log(f"{C.Y}[i] Aucun JS ni page live a analyser.{C.X}")
+        return
+    seed_file = os.path.join(outdir, "js_seeds.txt")
+    write_lines(seed_file, seeds)
+    out_base = os.path.join(outdir, "jsleaks")
+    log(f"{C.GR}[i] jsleaks sur {len(js_urls)} JS + {len(pages)} page(s) live "
+        f"(suit les chunks, recupere la config)...{C.X}")
+    cmd = [sys.executable, js_here, "-l", seed_file, "-o", out_base,
+           "--depth", str(args.js_depth)]
+    for hv in args.header:
+        cmd += ["-H", hv]
+    ok, lines = run(cmd, timeout=args.js_timeout)
+    # on montre l'essentiel (secrets + sinks) directement
+    show, cap = False, 0
+    for l in lines:
+        if any(k in l for k in ("SECRETS", "SINKS", "CONFIG", "ENDPOINTS INTERESSANTS")):
+            show = True
+        if show and l.strip() and cap < 60:
+            log(f"    {l}"); cap += 1
+    log(f"\n{C.CY}{C.BD}[=] Rapport JS -> {out_base}.txt / {out_base}.json{C.X}")
+
+# ----------------------------------------------------------------------
 BANNER = f"""{C.CY}{C.BD}
   hunt.py  -  orchestrateur de recon bug bounty{C.X}
 {C.GR}  subfinder -> httpx -> naabu -> katana/gau -> nuclei  (repli pur-python){C.X}
@@ -331,6 +367,9 @@ def main():
     p.add_argument("--ports", action="store_true", help="Ajouter le scan de ports (naabu)")
     p.add_argument("--no-nuclei", action="store_true", help="Ne pas lancer nuclei")
     p.add_argument("--no-urls", action="store_true", help="Ne pas collecter les URLs")
+    p.add_argument("--no-js", action="store_true", help="Ne pas analyser les JS (jsleaks)")
+    p.add_argument("-H", "--header", action="append", default=[],
+                   help="Header custom 'Nom: valeur' (repetable, ex: X-HackerOne-Research)")
     p.add_argument("--passive-only", action="store_true",
                    help="Seulement sous-domaines + hotes vivants")
     p.add_argument("--amass", action="store_true", help="Ajouter amass (plus complet, plus lent)")
@@ -341,6 +380,9 @@ def main():
     p.add_argument("--nuclei-timeout", type=int, default=900, help="Timeout global nuclei en s")
     p.add_argument("--nuclei-rl", type=int, default=50, help="Rate limit nuclei req/s")
     p.add_argument("--nuclei-conc", type=int, default=25, help="Concurrence nuclei")
+    p.add_argument("--js-depth", type=int, default=2, help="Profondeur suivi chunks JS (defaut 2)")
+    p.add_argument("--js-pages", type=int, default=15, help="Nb de pages live analysees par jsleaks (defaut 15)")
+    p.add_argument("--js-timeout", type=int, default=600, help="Timeout global jsleaks en s")
     p.add_argument("-t", "--threads", type=int, default=100, help="Threads (repli python)")
     p.add_argument("--timeout", type=float, default=8, help="Timeout HTTP (repli python)")
     p.add_argument("-o", "--output", default="results", help="Dossier de sortie (defaut results/)")
@@ -359,6 +401,13 @@ def main():
     os.makedirs(outdir, exist_ok=True)
     start = time.time()
 
+    # headers custom -> propages au repli recon.py (fallback pur python)
+    if R and args.header:
+        for hv in args.header:
+            if ":" in hv:
+                k, v = hv.split(":", 1)
+                R.EXTRA_HEADERS[k.strip()] = v.strip()
+
     log(f"{C.GR}[i] Cible : {domain} | sortie : {outdir}/{C.X}")
     tools = [t for t in ("subfinder", "assetfinder", "amass", "httpx", "naabu",
                          "gau", "waybackurls", "katana", "nuclei") if have(t)]
@@ -370,8 +419,11 @@ def main():
     if not args.passive_only:
         if args.ports:
             stage_ports(subs_file, outdir, args)
+        urls_file = os.path.join(outdir, "urls.txt")
         if not args.no_urls:
-            stage_urls(domain, live_file, outdir, args)
+            urls_file, _ = stage_urls(domain, live_file, outdir, args)
+        if not args.no_js:
+            stage_jsleaks(live_file, urls_file, outdir, args)
         if not args.no_nuclei:
             stage_nuclei(live_file, outdir, args)
 
@@ -380,6 +432,7 @@ def main():
     for name, fn in (("Sous-domaines", "subdomains.txt"), ("Hotes vivants", "live.txt"),
                      ("Ports", "ports.txt"), ("URLs", "urls.txt"),
                      ("URLs interessantes", "urls_interessantes.txt"),
+                     ("Analyse JS (jsleaks)", "jsleaks.txt"),
                      ("Vulns nuclei", "nuclei.txt")):
         path = os.path.join(outdir, fn)
         if os.path.isfile(path):

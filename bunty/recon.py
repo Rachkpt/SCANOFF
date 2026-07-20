@@ -48,7 +48,37 @@ if os.name == "nt":
 
 def log(m): print(m)
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) recon/1.0"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+EXTRA_HEADERS = {}   # rempli par -H/--header (ex: X-HackerOne-Research)
+
+# Signatures de pages de challenge / blocage WAF (un "403" ou "200" ici n'est
+# PAS un vrai refus applicatif : c'est le WAF qui bloque notre requete non-navigateur)
+WAF_SIGNS = (
+    ("Just a moment", "Cloudflare (JS challenge)"),
+    ("Attention Required! | Cloudflare", "Cloudflare (block)"),
+    ("Enable JavaScript and cookies to continue", "Cloudflare (challenge)"),
+    ("cf-browser-verification", "Cloudflare (challenge)"),
+    ("challenge-platform", "Cloudflare (challenge)"),
+    ("Checking if the site connection is secure", "Cloudflare (challenge)"),
+    ("Request unsuccessful. Incapsula", "Imperva Incapsula"),
+    ("_Incapsula_Resource", "Imperva Incapsula"),
+    ("Access Denied", "Akamai/WAF"),
+    ("Reference #", "Akamai (block)"),
+    ("Pardon Our Interruption", "PerimeterX"),
+    ("px-captcha", "PerimeterX"),
+    ("<title>Just a moment...</title>", "Cloudflare (challenge)"),
+)
+
+def detect_waf(status, hdrs, text):
+    """Renvoie une etiquette WAF si la reponse est un challenge/block, sinon ''."""
+    if hdrs.get("cf-mitigated", "").lower() == "challenge":
+        return "Cloudflare (cf-mitigated)"
+    low = text[:4000]
+    for sign, label in WAF_SIGNS:
+        if sign in low:
+            return label
+    return ""
 
 # ----------------------------------------------------------------------
 # HTTP GET generique (via http.client, SSL non verifie)
@@ -64,7 +94,9 @@ def http_get(url, timeout=15, max_body=3_000_000):
                                                context=ssl._create_unverified_context())
         else:
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
-        conn.request("GET", path, headers={"User-Agent": UA, "Accept": "*/*"})
+        _h = {"User-Agent": UA, "Accept": "*/*"}
+        _h.update(EXTRA_HEADERS)
+        conn.request("GET", path, headers=_h)
         r = conn.getresponse()
         body = r.read(max_body)
         status = r.status
@@ -282,9 +314,10 @@ def http_probe(sub, timeout=8):
         if "drupal" in low: techno.append("Drupal")
         if "joomla" in low: techno.append("Joomla")
         if "cloudflare" in server.lower(): techno.append("Cloudflare")
+        waf = detect_waf(st, hdrs, text)
         cl = hdrs.get("content-length")
         return {"url": f"{scheme}://{sub}", "status": st, "title": title,
-                "server": server, "powered": powered,
+                "server": server, "powered": powered, "waf": waf,
                 "techno": techno, "length": int(cl) if cl and cl.isdigit() else len(body)}
     return None
 
@@ -380,12 +413,19 @@ def main():
     p.add_argument("--no-resolve", action="store_true", help="Ne pas resoudre (garder tout le passif brut)")
     p.add_argument("-t", "--threads", type=int, default=100, help="Threads DNS (defaut 100)")
     p.add_argument("--timeout", type=float, default=8, help="Timeout HTTP (defaut 8)")
+    p.add_argument("-H", "--header", action="append", default=[],
+                   help="Header custom 'Nom: valeur' (repetable, ex: X-HackerOne-Research)")
     p.add_argument("-o", "--output", help="Nom de base des rapports (.txt .json .html)")
     args = p.parse_args()
 
     print(BANNER)
     if not args.domain:
         p.print_help(); sys.exit(0)
+
+    for hv in args.header:
+        if ":" in hv:
+            k, v = hv.split(":", 1)
+            EXTRA_HEADERS[k.strip()] = v.strip()
 
     domain = args.domain.strip().lower().strip("/")
     domain = re.sub(r"^https?://", "", domain).split("/")[0]
@@ -408,12 +448,20 @@ def main():
         log(f"\n{C.B}{C.BD}{'='*70}{C.X}")
         log(f"{C.B}{C.BD}  HOTES VIVANTS ({len(probes)}){C.X}")
         log(f"{C.B}{C.BD}{'='*70}{C.X}")
+        n_waf = sum(1 for p in probes if p.get("waf"))
         for pr in probes:
             t = f"{C.GR}{pr['title']}{C.X}" if pr["title"] else ""
             tech = f" {C.CY}{'/'.join(pr['techno'])}{C.X}" if pr["techno"] else ""
             srv = f" {C.GR}[{pr['server']}]{C.X}" if pr["server"] else ""
+            # un challenge WAF n'est pas un vrai statut applicatif -> on le signale
+            waf = f" {C.R}{C.BD}[WAF: {pr['waf']}]{C.X}" if pr.get("waf") else ""
             log(f"  {color_status(pr['status'])}{pr['status']}{C.X} "
-                f"{pr['url']:<45} {t}{srv}{tech}")
+                f"{pr['url']:<45} {t}{srv}{tech}{waf}")
+        if n_waf:
+            log(f"\n{C.R}  [i] {n_waf} hote(s) derriere un challenge WAF : leur code "
+                f"(403/503/200) n'est PAS le vrai statut applicatif.{C.X}")
+            log(f"{C.GR}      -> a revisiter avec un navigateur reel (challenge JS) "
+                f"ou via l'origine si elle fuite.{C.X}")
     else:
         log(f"\n{C.B}{C.BD}[=] Sous-domaines resolvant :{C.X}")
         for s in sorted(live):
