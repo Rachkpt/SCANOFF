@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Sorties generees par les outils (rapports, resultats de scan)
+results/
+live_hosts.txt
+*.report.json
+rapport*.json
+rapport*.txt
+rapport*.html
+resultats*.json
+resultats*.txt
+resultats*.html
+takeover*.json
+takeover*.txt
+takeover*.html
+*_api.*
+
+# Wordlists / donnees lourdes (ne pas versionner)
+*.log
+seclists/
+SecLists/
+
+# OS / editeurs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
